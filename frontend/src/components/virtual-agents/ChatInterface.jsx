@@ -5,7 +5,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import {
     Bot, User, Loader2, ArrowUp, Mic, Square, X, Settings,
-    Search, Play, Star, ChevronDown, BrainCircuit
+    Search, Play, Star, ChevronDown, BrainCircuit, Globe, Link
 } from 'lucide-react';
 import styles from './VAgents.styles.js';
 import { RAG_BACKEND_URL } from './VAgents.utils.js';
@@ -111,6 +111,82 @@ const CategorySelector = ({ categories, onSelect }) => (
         )) : <p style={styles.p}>No Active Agents available.</p>}
     </div>
 );
+
+// ==============================================================================
+// BROWSER TASK MODAL
+// ==============================================================================
+const BrowserTaskModal = ({ open, onClose, onSubmit, isLoading }) => {
+    const [url, setUrl] = useState('');
+    const [instruction, setInstruction] = useState('');
+    const [taskType, setTaskType] = useState('general');
+
+    if (!open) return null;
+
+    const handleSubmit = (e) => {
+        e.preventDefault();
+        onSubmit(url, instruction, taskType);
+    };
+
+    return (
+        <div style={styles.modalOverlay}>
+            <div style={styles.modalContent}>
+                <div style={styles.modalHeader}>
+                    <h2 style={styles.modalTitle}>New Browser Automation Task</h2>
+                    <button onClick={onClose} style={styles.modalCloseButton}><X size={24} /></button>
+                </div>
+                <form onSubmit={handleSubmit} style={styles.modalBody}>
+                    <p style={{ color: 'var(--muted-foreground)', marginBottom: '1.5rem', fontSize: '0.9rem' }}>
+                        Instruct the Agent to perform actions on external websites, Google Forms, Docs, or Social Media.
+                    </p>
+                    
+                    <div style={styles.formGroup}>
+                        <label style={styles.label}>Target URL</label>
+                        <div style={{ position: 'relative' }}>
+                            <Link size={16} style={{ position: 'absolute', top: '12px', left: '12px', color: 'var(--muted-foreground)' }} />
+                            <input 
+                                style={{ ...styles.input, paddingLeft: '2.5rem' }} 
+                                placeholder="https://docs.google.com/..." 
+                                value={url} 
+                                onChange={e => setUrl(e.target.value)}
+                                required 
+                            />
+                        </div>
+                    </div>
+
+                    <div style={styles.formGroup}>
+                        <label style={styles.label}>Task Type</label>
+                        <select style={styles.input} value={taskType} onChange={e => setTaskType(e.target.value)}>
+                            <option value="general">General Automation</option>
+                            <option value="google_form">Fill Google Form</option>
+                            <option value="google_doc">Write in Google Doc</option>
+                            <option value="google_sheet">Edit Google Sheet</option>
+                            <option value="social_comment">Social Media Comment</option>
+                        </select>
+                    </div>
+
+                    <div style={styles.formGroup}>
+                        <label style={styles.label}>Detailed Instructions</label>
+                        <textarea 
+                            style={styles.textarea} 
+                            rows={4} 
+                            placeholder="e.g., 'Fill the email field with user@example.com and submit' or 'Write a summary of the meeting in the doc'"
+                            value={instruction}
+                            onChange={e => setInstruction(e.target.value)}
+                            required
+                        />
+                    </div>
+
+                    <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.75rem', marginTop: '1rem' }}>
+                        <button type="button" onClick={onClose} style={styles.buttonSecondary}>Cancel</button>
+                        <button type="submit" style={styles.buttonPrimary} disabled={isLoading}>
+                            {isLoading ? <><Loader2 style={styles.spinner} size={16} /> Running Agent...</> : 'Launch Task'}
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    );
+};
 
 const VoiceSettingsModal = ({
     open,
@@ -266,6 +342,8 @@ const QueryInterface = ({ currentUser, owner, category, selectedCategory, person
     const [status, setStatus] = useState('idle');
     const [isVoiceMode, setIsVoiceMode] = useState(isVoiceQuery);
     const [isVoiceModalOpen, setVoiceModalOpen] = useState(false);
+    const [isBrowserModalOpen, setIsBrowserModalOpen] = useState(false);
+    const [isBrowserTaskRunning, setIsBrowserTaskRunning] = useState(false);
     const [error, setError] = useState('');
 
     const [allVoices, setAllVoices] = useState({ google: [], elevenlabs: [], deepgram: [] });
@@ -426,6 +504,42 @@ const QueryInterface = ({ currentUser, owner, category, selectedCategory, person
         }
         setStatus(isVoiceMode ? 'listening' : 'idle');
     }, [isVoiceMode]);
+
+    const handleBrowserTask = async (url, instruction, taskType) => {
+        setIsBrowserTaskRunning(true);
+        // Add a placeholder message for the user
+        const userMsg = { sender: 'user', text: `🌐 Task: ${taskType}\nURL: ${url}\nInstruction: ${instruction}` };
+        setChat(prev => [...prev, userMsg]);
+        setStatus('thinking');
+
+        try {
+            const payload = {
+                firm_id: parseInt(firmid),
+                url,
+                instruction,
+                task_type: taskType
+            };
+            
+            // Call Backend Proxy
+            const resp = await axios.post(`${RAG_BACKEND_URL}/api/agent/browser-task`, payload);
+            
+            const aiMsg = { 
+                sender: 'ai', 
+                text: `✅ **Task Completed**\n\n${resp.data.message}` 
+            };
+            setChat(prev => [...prev, aiMsg]);
+        } catch (err) {
+            const errorMsg = { 
+                sender: 'ai', 
+                text: `❌ **Task Failed**\n\n${err.response?.data?.detail || err.message}` 
+            };
+            setChat(prev => [...prev, errorMsg]);
+        } finally {
+            setIsBrowserTaskRunning(false);
+            setIsBrowserModalOpen(false);
+            setStatus('idle');
+        }
+    };
 
     const sendQuery = useCallback(async (text) => {
         if (!text || !text.trim()) {
@@ -682,6 +796,13 @@ const QueryInterface = ({ currentUser, owner, category, selectedCategory, person
                 apiKeys={apiKeys}
             />
 
+            <BrowserTaskModal 
+                open={isBrowserModalOpen} 
+                onClose={() => setIsBrowserModalOpen(false)} 
+                onSubmit={handleBrowserTask} 
+                isLoading={isBrowserTaskRunning} 
+            />
+
             {isVoiceMode ? (
                 <div style={styles.voiceFullScreen}>
                     <div style={styles.liveTranscriptContainer}>
@@ -750,7 +871,6 @@ const QueryInterface = ({ currentUser, owner, category, selectedCategory, person
                                 </div>
                             )}
                             {chat.map((m, i) => {
-                                // FIXED: Use regex to split by both forward and back slashes for Windows path compatibility
                                 const uniqueSources = m.sources?.length > 0 ? [...new Set(m.sources.map(s => s.source.split(/[/\\]/).pop()))] : [];
                                 return (
                                     <div key={i} style={m.sender === 'user' ? styles.userMessage : styles.aiMessage}>
@@ -779,7 +899,7 @@ const QueryInterface = ({ currentUser, owner, category, selectedCategory, person
                     <div style={styles.chatInputContainer}>
                         <div style={styles.chatInputArea}>
                             {error && <div style={{ ...styles.alert, ...styles.alertDanger, marginBottom: '1rem' }}>{error}</div>}
-                            <ChatInput status={status} onSubmit={sendQuery} onVoiceClick={enterVoiceMode} onStop={handleStop} />
+                            <ChatInput status={status} onSubmit={sendQuery} onVoiceClick={enterVoiceMode} onStop={handleStop} onBrowserClick={() => setIsBrowserModalOpen(true)} />
                         </div>
                     </div>
                 </>
@@ -788,7 +908,7 @@ const QueryInterface = ({ currentUser, owner, category, selectedCategory, person
     );
 };
 
-const ChatInput = ({ status, onSubmit, onVoiceClick, onStop }) => {
+const ChatInput = ({ status, onSubmit, onVoiceClick, onStop, onBrowserClick }) => {
     const [query, setQuery] = useState('');
     const textareaRef = useRef(null);
 
@@ -818,6 +938,7 @@ const ChatInput = ({ status, onSubmit, onVoiceClick, onStop }) => {
 
     return (
         <div style={styles.inputWrapper}>
+             <button onClick={onBrowserClick} style={{...styles.iconButton, marginRight: '0.5rem', border: 'none', background: 'transparent'}} title="Launch Browser Task"><Globe size={20} /></button>
             <textarea
                 ref={textareaRef}
                 value={query}

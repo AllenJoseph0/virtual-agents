@@ -62,3 +62,10 @@ mcp>=1.0.0
 streamlit>=1.40.0
 mcp-client>=1.0.1
 sseclient-py>=1.8.0
+
+google-api-python-client
+google-auth
+playwright
+beautifulsoup4
+lxml
+#playwright install

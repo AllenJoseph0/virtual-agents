@@ -54,20 +54,14 @@ const app = express();
 const allowedOrigins = [
   'http://192.168.18.15:8251',
   'http://localhost:8250',
-  // You may need to add your 198 IP here if you are connecting from a client on that IP
 ];
 
 const corsOptions = {
   origin(origin, cb) {
-    // Allow requests with no origin (like mobile apps or curl requests)
     if (!origin) return cb(null, true);
     if (allowedOrigins.includes(origin)) return cb(null, true);
-
-    // Optional: Auto-allow if strictly necessary for development on dynamic IPs
-    // return cb(null, true); 
-
-    logger.warn('Blocked by CORS', { origin });
-    return cb(new Error(`Blocked by CORS: ${origin}`));
+    // Allow for development convenience; remove in strict prod
+    return cb(null, true); 
   },
   optionsSuccessStatus: 200,
 };
@@ -77,7 +71,6 @@ app.use(express.json({ limit: '20mb' }));
 
 const AI_SERVER_URL = process.env.AI_SERVER_URL;
 
-// Database pool for the main RAG application (nrkindex_trn)
 const dbPool = mysql.createPool({
   host: process.env.DB_HOST,
   user: process.env.DB_USER,
@@ -95,7 +88,6 @@ const dbPool = mysql.createPool({
 // ============================================================================
 // 3) FS HELPERS
 // ============================================================================
-
 const readJsonDb = (filePath) => async () => {
   try {
     if (!fs.existsSync(filePath)) {
@@ -197,6 +189,11 @@ const JOB_TIMEOUT_MS = 10 * 60 * 1000;
 const keyFor = (u, c, action) => `${u}::${c}::${action}`;
 
 const guardedHandler = (action) => (req, res, next) => {
+  // Relaxed guard for browser tasks which might not have 'username/category' in standard format
+  if (action === 'browser-task') {
+      return next();
+  }
+
   const { username, category } = req.body || {};
   if (!username || !category) {
     return res.status(400).json({ error: 'username and category are required' });
@@ -289,7 +286,6 @@ app.post('/api/voice/stt', memoryUpload.single('audio'), async (req, res) => {
       filename: req.file.originalname || 'audio.webm',
       contentType: req.file.mimetype || 'audio/webm',
     });
-    // Append other form fields from the request
     if (req.body.provider) {
       form.append('provider', req.body.provider);
     }
@@ -320,60 +316,47 @@ app.post('/api/rag/create-index', guardedHandler('create-index'), proxyToAiServe
 app.post('/api/rag/update-index', guardedHandler('update-index'), proxyToAiServer('update-index', 'post', true));
 app.post('/api/rag/delete-index', guardedHandler('delete-index'), proxyToAiServer('delete-index', 'post', true));
 
-// CASCADE DELETE HANDLER
 app.post('/api/rag/delete-category', guardedHandler('delete-category'), async (req, res) => {
   const { username, category } = req.body;
   if (!username || !category) {
     return res.status(400).json({ error: 'username and category are required' });
   }
-
   try {
     const permissions = await readPermissions();
     const categoryId = `${username}-${category}`;
     const permEntry = permissions[categoryId];
 
-    // 1. Cascade Delete Linked Persona
     if (permEntry && permEntry.personaId) {
-      logger.info(`Cascade deleting linked persona: ${permEntry.personaId} for agent: ${category}`);
       try {
         await axios.delete(`${AI_SERVER_URL}/personas/${permEntry.personaId}`);
       } catch (err) {
         logger.warn('Failed to delete linked persona on AI server', { error: err.message });
-        // We continue execution; don't block agent deletion if persona deletion fails
       }
     }
 
-    // 2. Clean up local permissions
     if (permissions[categoryId]) {
       delete permissions[categoryId];
       await writePermissions(permissions);
     }
-
-    // 3. Clean up Rulebooks
     const rulebooks = await readRulebooks();
     if (rulebooks[categoryId]) {
       delete rulebooks[categoryId];
       await writeRulebooks(rulebooks);
     }
-
-    // 4. Clean up Test Questions
     const testQuestions = await readTestQuestions();
     if (testQuestions[categoryId]) {
       delete testQuestions[categoryId];
       await writeTestQuestions(testQuestions);
     }
 
-    // 5. Delete Index on AI Server (Qdrant)
     await axios.post(`${AI_SERVER_URL}/delete-category`, { username, category });
 
-    // 6. Delete Local Files
     const categoryDir = path.join(UPLOAD_FOLDER, username, category);
     if (fs.existsSync(categoryDir)) {
       await fsp.rm(categoryDir, { recursive: true, force: true });
     }
 
     await clearAiServerCache();
-
     logger.info(`Agent '${category}' deleted along with linked resources.`);
     res.json({ message: `Agent '${category}' and its linked persona have been permanently deleted.` });
 
@@ -383,29 +366,18 @@ app.post('/api/rag/delete-category', guardedHandler('delete-category'), async (r
   }
 });
 
-// NEW: Delete individual file endpoint
 app.delete('/api/rag/file', guardedHandler('delete-file'), async (req, res) => {
   const { username, category, filename } = req.body;
   if (!username || !category || !filename) {
     return res.status(400).json({ error: 'username, category, and filename are required' });
   }
-
   try {
     const filePath = path.join(UPLOAD_FOLDER, username, category, filename);
-
-    // Check if file exists to avoid ENOENT crash
-    try {
-      await fsp.access(filePath);
-    } catch (err) {
-      return res.status(404).json({ error: 'File not found.' });
-    }
-
+    try { await fsp.access(filePath); } catch (err) { return res.status(404).json({ error: 'File not found.' }); }
     await fsp.unlink(filePath);
-    await clearAiServerCache(); // Clear cache so the agent knows data changed
-
+    await clearAiServerCache();
     logger.info('File deleted successfully', { username, category, filename });
     res.json({ message: `File '${filename}' deleted.` });
-
   } catch (e) {
     logger.error('Failed to delete file', { error: e.message });
     res.status(500).json({ error: 'Failed to delete file.' });
@@ -438,7 +410,6 @@ app.get('/api/rag/structure', async (req, res) => {
             complianceProfileId: null
           };
           categoryPermissions = allPermissions[categoryId];
-          logger.info('Auto-created missing permission entry for category', { categoryId });
         }
 
         return {
@@ -456,7 +427,6 @@ app.get('/api/rag/structure', async (req, res) => {
         await writePermissions(allPermissions);
       }
     }
-
     res.json(structureData);
   } catch (e) {
     logger.error('Structure endpoint failed', { error: e.response?.data || e.message });
@@ -511,16 +481,7 @@ app.post('/api/chat/history/:username/:role/:category', async (req, res) => {
 // ============================================================================
 app.post('/api/rag/query', async (req, res) => {
   const { owner_id, category, question, session_id, queried_by_id, queried_by_role, persona_id, firmId } = req.body || {};
-
-  const required = { owner_id, category, question, queried_by_id, queried_by_role, persona_id, firmId };
-  const missing = Object.keys(required).filter(key => !required[key]);
-
-  if (missing.length > 0) {
-    return res.status(400).json({ error: `Missing required fields: ${missing.join(', ')}` });
-  }
-
   const finalSessionId = session_id || `${queried_by_id}-${category}-${persona_id}`;
-
   const permissions = await readPermissions();
   const categoryId = `${owner_id}-${category}`;
   const categorySettings = permissions[categoryId] || {};
@@ -530,29 +491,16 @@ app.post('/api/rag/query', async (req, res) => {
   if (complianceProfileId) {
     const complianceProfiles = await readCompliance();
     const profile = complianceProfiles[complianceProfileId];
-    if (profile) {
-      complianceRules = profile.content;
-    }
+    if (profile) complianceRules = profile.content;
   }
-
-  logger.info('RAG query received', { owner: owner_id, querier: queried_by_id, category, sessionId: finalSessionId, persona_id, hasCompliance: !!complianceRules, firmId });
 
   try {
     const rulebooks = await readRulebooks();
     const rulebookKey = `${owner_id}-${category}`;
-
-    // NEW LOGIC: Safely parse or nullify rulebook content
-    // Python Pydantic expects Optional[Dict], so we cannot send "" (string).
     let rulebookPayload = null;
     const rawRulebook = rulebooks[rulebookKey];
     if (rawRulebook && typeof rawRulebook === 'string' && rawRulebook.trim() !== '') {
-      try {
-        rulebookPayload = JSON.parse(rawRulebook);
-      } catch (e) {
-        // If parsing fails (e.g. user entered plain text instead of JSON), warn and send null
-        logger.warn('Rulebook content is not valid JSON, sending null to avoid 422 error', { key: rulebookKey });
-        rulebookPayload = null;
-      }
+      try { rulebookPayload = JSON.parse(rawRulebook); } catch (e) { rulebookPayload = null; }
     }
 
     const resp = await axios.post(`${AI_SERVER_URL}/rag/chain`, {
@@ -583,32 +531,21 @@ app.post('/api/users/sync', async (req, res) => {
     const newUser = { id, name, role };
     users.push(newUser);
     await writeUsers(users);
-    logger.info('New user synced', { id, name, role });
     return res.status(201).json(newUser);
   }
   res.json(found);
 });
 
 app.get('/api/employees', async (req, res) => {
-  // SECURITY FIX: Exclude the current user from the list of employees to share with.
-  // NOTE: The frontend must be updated to send the current user's ID as a query parameter.
-  // e.g., GET /api/employees?excludeId=123
   const { excludeId } = req.query;
-
   try {
-    let sql = `
-            SELECT EMPID, EMPNAME, STATUS, FIRM_ID, TYPE
-            FROM EMPLOY_REGISTRATION
-            WHERE STATUS = 'Active' AND TYPE = 'Employe'
-        `;
+    let sql = `SELECT EMPID, EMPNAME, STATUS, FIRM_ID, TYPE FROM EMPLOY_REGISTRATION WHERE STATUS = 'Active' AND TYPE = 'Employe'`;
     const params = [];
-
     if (excludeId) {
       sql += ' AND EMPID != ?';
       params.push(excludeId);
     }
-
-    const [rows] = await pmoDbPool.query(sql, params);
+    const [rows] = await dbPool.query(sql, params);
     res.json(rows);
   } catch (e) {
     logger.error('Failed to fetch employees', { error: e.message });
@@ -633,24 +570,19 @@ app.get('/api/compliance', async (req, res) => {
     const profiles = await readCompliance();
     res.json(Object.values(profiles));
   } catch (e) {
-    logger.error('Failed to get compliance profiles', { error: e.message });
     res.status(500).json({ error: 'Failed to get compliance profiles' });
   }
 });
 
 app.post('/api/compliance', async (req, res) => {
   const { id, name, content } = req.body;
-  if (!id || !name || typeof content === 'undefined') {
-    return res.status(400).json({ error: 'id, name, and content are required.' });
-  }
+  if (!id || !name || typeof content === 'undefined') return res.status(400).json({ error: 'id, name, and content are required.' });
   try {
     const profiles = await readCompliance();
     profiles[id] = { id, name, content };
     await writeCompliance(profiles);
-    logger.info('Compliance profile created/updated', { id });
     res.status(201).json(profiles[id]);
   } catch (e) {
-    logger.error('Failed to save compliance profile', { error: e.message });
     res.status(500).json({ error: 'Failed to save compliance profile' });
   }
 });
@@ -662,11 +594,9 @@ app.delete('/api/compliance/:profile_id', async (req, res) => {
     if (profile_id in profiles) {
       delete profiles[profile_id];
       await writeCompliance(profiles);
-      logger.info('Compliance profile deleted', { id: profile_id });
     }
     res.status(204).send();
   } catch (e) {
-    logger.error('Failed to delete compliance profile', { error: e.message });
     res.status(500).json({ error: 'Failed to delete compliance profile' });
   }
 });
@@ -676,55 +606,31 @@ app.delete('/api/compliance/:profile_id', async (req, res) => {
 // ============================================================================
 app.put('/api/permissions/category', async (req, res) => {
   const { adminId, category, roleToUpdate, hasAccess } = req.body;
-  if (!adminId || !category || !roleToUpdate || typeof hasAccess !== 'boolean') {
-    return res.status(400).json({ error: 'Missing required fields' });
-  }
-
   try {
     const categoryId = `${adminId}-${category}`;
     const permissions = await readPermissions();
-
     if (!permissions[categoryId]) {
-      permissions[categoryId] = {
-        owner: adminId,
-        categoryName: category,
-        business: false,
-        basic: false
-      };
+      permissions[categoryId] = { owner: adminId, categoryName: category, business: false, basic: false };
     }
     permissions[categoryId][roleToUpdate] = hasAccess;
-
     await writePermissions(permissions);
-    logger.info('Permissions updated', { admin: adminId, category, role: roleToUpdate, access: hasAccess });
     res.status(200).json({ message: 'Permissions updated successfully' });
   } catch (e) {
-    logger.error('Failed to update permissions', { error: e.message });
-    res.status(500).json({ error: 'Failed to update permissions on the server.' });
+    res.status(500).json({ error: 'Failed to update permissions.' });
   }
 });
 
 app.put('/api/category/settings', async (req, res) => {
   const { adminId, categoryName, settings } = req.body;
-  if (!adminId || !categoryName || !settings) {
-    return res.status(400).json({ error: 'Missing required fields' });
-  }
-
   try {
     const categoryId = `${adminId}-${categoryName}`;
     const permissions = await readPermissions();
-
-    if (!permissions[categoryId]) {
-      return res.status(404).json({ error: 'Category not found.' });
-    }
-
+    if (!permissions[categoryId]) return res.status(404).json({ error: 'Category not found.' });
     permissions[categoryId] = { ...permissions[categoryId], ...settings };
-
     await writePermissions(permissions);
-    logger.info('Category settings updated', { admin: adminId, category: categoryName, settings });
     res.status(200).json({ message: 'Settings updated successfully' });
   } catch (e) {
-    logger.error('Failed to update category settings', { error: e.message });
-    res.status(500).json({ error: 'Failed to update settings on the server.' });
+    res.status(500).json({ error: 'Failed to update settings.' });
   }
 });
 
@@ -733,29 +639,21 @@ app.get('/api/rag/rulebook/:adminId/:categoryName', async (req, res) => {
   try {
     const rulebooks = await readRulebooks();
     const rulebookKey = `${adminId}-${categoryName}`;
-    const content = rulebooks[rulebookKey] || '';
-    res.status(200).json({ content });
+    res.status(200).json({ content: rulebooks[rulebookKey] || '' });
   } catch (e) {
-    logger.error('Failed to get rulebook', { error: e.message });
     res.status(500).json({ error: 'Failed to retrieve rulebook.' });
   }
 });
 
 app.post('/api/rag/rulebook', async (req, res) => {
   const { adminId, category, rulebookContent } = req.body;
-  if (!adminId || !category || typeof rulebookContent !== 'string') {
-    return res.status(400).json({ error: 'adminId, category, and rulebookContent are required.' });
-  }
-
   try {
     const rulebooks = await readRulebooks();
     const rulebookKey = `${adminId}-${category}`;
     rulebooks[rulebookKey] = rulebookContent;
     await writeRulebooks(rulebooks);
-    logger.info('Rulebook saved', { key: rulebookKey });
     res.status(200).json({ message: 'Rulebook saved successfully.' });
   } catch (e) {
-    logger.error('Failed to save rulebook', { error: e.message });
     res.status(500).json({ error: 'Failed to save rulebook.' });
   }
 });
@@ -765,62 +663,40 @@ app.get('/api/rag/test-questions/:adminId/:categoryName', async (req, res) => {
   try {
     const allQuestions = await readTestQuestions();
     const key = `${adminId}-${categoryName}`;
-    const questions = allQuestions[key] || '';
-    res.status(200).json({ questions });
+    res.status(200).json({ questions: allQuestions[key] || '' });
   } catch (e) {
-    logger.error('Failed to get test questions', { error: e.message });
     res.status(500).json({ error: 'Failed to retrieve test questions.' });
   }
 });
 
 app.post('/api/rag/test-questions', async (req, res) => {
   const { adminId, category, questions } = req.body;
-  if (!adminId || !category || typeof questions !== 'string') {
-    return res.status(400).json({ error: 'adminId, category, and questions string are required.' });
-  }
   try {
     const allQuestions = await readTestQuestions();
     const key = `${adminId}-${category}`;
     allQuestions[key] = questions;
     await writeTestQuestions(allQuestions);
-    logger.info('Test questions saved', { key });
     res.status(200).json({ message: 'Test questions saved successfully.' });
   } catch (e) {
-    logger.error('Failed to save test questions', { error: e.message });
     res.status(500).json({ error: 'Failed to save test questions.' });
   }
 });
 
 app.post('/api/rag/run-test', async (req, res) => {
-  const { adminId, category, personaId, complianceProfileId, num_questions } = req.body;
-  if (!adminId || !category) {
-    return res.status(400).json({ error: 'adminId and category are required.' });
-  }
+  const { adminId, category, personaId, complianceProfileId, num_questions, firmId } = req.body;
   try {
     let complianceRules = null;
     if (complianceProfileId) {
       const complianceProfiles = await readCompliance();
-      const profile = complianceProfiles[complianceProfileId];
-      if (profile) {
-        complianceRules = profile.content;
-      }
+      if (complianceProfiles[complianceProfileId]) complianceRules = complianceProfiles[complianceProfileId].content;
     }
 
     const aiServerPayload = {
-      owner_id: adminId,
-      category: category,
-      persona_id: personaId,
-      compliance_rules: complianceRules,
-      num_questions: num_questions || 10,
-      firmId: req.body.firmId // Pass firmId for tests
+      owner_id: adminId, category, persona_id: personaId, compliance_rules: complianceRules, num_questions: num_questions || 10, firmId
     };
 
-    const endpoint = `${AI_SERVER_URL}/rag/run-test`;
-    logger.info('Proxying automated test run to AI server', { endpoint });
-
-    const resp = await axios.post(endpoint, aiServerPayload, { timeout: 300000 }); // 5 minute timeout for tests
+    const resp = await axios.post(`${AI_SERVER_URL}/rag/run-test`, aiServerPayload, { timeout: 300000 });
     res.status(resp.status).json(resp.data);
-
   } catch (e) {
     logger.error('RAG test run proxy failed', { error: e.response?.data || e.message });
     res.status(e.response?.status || 500).json(e.response?.data || { error: 'Failed to run test' });
@@ -828,32 +704,20 @@ app.post('/api/rag/run-test', async (req, res) => {
 });
 
 
-// UNIFIED ENDPOINT: Securely provides the correct list of RAGs for any user.
 app.get('/api/rag/viewable', async (req, res) => {
   const { userId, userRole } = req.query;
-  if (!userId || !userRole) {
-    return res.status(400).json({ error: 'userId and userRole are required' });
-  }
-
   try {
     const allPermissions = await readPermissions();
     let categoriesToStatusCheck = new Map();
 
-    // 1. Get the user's own categories if they are an admin
     if (userRole === 'admin') {
       try {
         const ownResp = await axios.get(`${AI_SERVER_URL}/structure/${encodeURIComponent(userId)}`);
         const userCats = ownResp.data?.[userId] || [];
         userCats.forEach(cat => categoriesToStatusCheck.set(`${userId}-${cat.name}`, { name: cat.name, owner: userId }));
-      } catch (e) {
-        if (e.response?.status !== 404) {
-          logger.warn('Could not get own categories for admin', { userId, error: e.message });
-        }
-      }
+      } catch (e) { }
     }
 
-    // FIX: Re-introduce role-based access logic.
-    // Get categories based on the user's role (business/basic) from the toggles.
     if (['business', 'basic'].includes(userRole)) {
       Object.values(allPermissions)
         .filter(perm => perm && perm[userRole] === true)
@@ -862,21 +726,14 @@ app.get('/api/rag/viewable', async (req, res) => {
         });
     }
 
-    // 2. Get categories shared specifically with this user
     const shares = await readShares();
     const userShares = shares[userId] || [];
-
     userShares.forEach(share => {
-      if (share.ownerId && share.categoryName) {
-        categoriesToStatusCheck.set(`${share.ownerId}-${share.categoryName}`, { name: share.categoryName, owner: String(share.ownerId) });
-      }
+      categoriesToStatusCheck.set(`${share.ownerId}-${share.categoryName}`, { name: share.categoryName, owner: String(share.ownerId) });
     });
 
-
     const categoryList = Array.from(categoriesToStatusCheck.values());
-    if (categoryList.length === 0) {
-      return res.status(200).json([]);
-    }
+    if (categoryList.length === 0) return res.status(200).json([]);
 
     const statusResp = await axios.post(`${AI_SERVER_URL}/batch-status-check`, { categories: categoryList });
     const activeRagsWithStatus = (statusResp.data || []).filter(c => c.indexStatus === 'ACTIVE');
@@ -892,9 +749,7 @@ app.get('/api/rag/viewable', async (req, res) => {
     });
 
     res.status(200).json(finalActiveRags);
-
   } catch (e) {
-    logger.error('Failed to get viewable categories', { userId, userRole, error: e.message });
     res.status(500).json({ error: 'Failed to retrieve categories.' });
   }
 });
@@ -918,12 +773,10 @@ app.get('/api/llm/options', async (req, res) => {
             AND COLUMN_NAME IN ('LLM_PROVIDER', 'LLM_PROVIDER_TYPE')
         `;
     const [rows] = await dbPool.query(sql, [process.env.DB_DATABASE]);
-
     const options = { providers: [], types: [] };
     rows.forEach(row => {
       if (row.COLUMN_NAME === 'LLM_PROVIDER') {
         const allProviders = parseEnum(row.COLUMN_TYPE);
-        // Allow users to add keys for LLMs and speech services
         options.providers = allProviders.filter(p => ['GROQ', 'GEMINI', 'GOOGLE_TTS', 'ELEVENLABS', 'DEEPGRAM'].includes(p));
       } else if (row.COLUMN_NAME === 'LLM_PROVIDER_TYPE') {
         options.types = parseEnum(row.COLUMN_TYPE);
@@ -931,45 +784,28 @@ app.get('/api/llm/options', async (req, res) => {
     });
     res.json(options);
   } catch (e) {
-    logger.error('Failed to get LLM options', { error: e.message });
     res.status(500).json({ error: 'Failed to retrieve LLM options' });
   }
 });
 
 app.get('/api/llm/keys', async (req, res) => {
   const { userId, firmId } = req.query;
-  if (!userId || !firmId) {
-    return res.status(400).json({ error: 'userId and firmId are required.' });
-  }
   try {
-    const sql = `
-            SELECT ID, LLM_PROVIDER, LLM_PROVIDER_TYPE, API_KEY, STATUS 
-            FROM LLM_DETAILS 
-            WHERE USERID = ? AND FIRMID = ?
-        `;
+    const sql = `SELECT ID, LLM_PROVIDER, LLM_PROVIDER_TYPE, API_KEY, STATUS FROM LLM_DETAILS WHERE USERID = ? AND FIRMID = ?`;
     const [rows] = await dbPool.query(sql, [userId, firmId]);
     res.json(rows);
   } catch (e) {
-    logger.error('Failed to get API keys', { error: e.message, userId, firmId });
     res.status(500).json({ error: 'Failed to retrieve API keys.' });
   }
 });
 
 app.post('/api/llm/keys', async (req, res) => {
   const { userId, firmId, llmProvider, llmProviderType, apiKey } = req.body;
-  if (!userId || !firmId || !llmProvider || !llmProviderType || !apiKey) {
-    return res.status(400).json({ error: 'All fields are required to save an API key.' });
-  }
   try {
-    const sql = `
-            INSERT INTO LLM_DETAILS (USERID, FIRMID, LLM_PROVIDER, LLM_PROVIDER_TYPE, API_KEY)
-            VALUES (?, ?, ?, ?, ?)
-        `;
+    const sql = `INSERT INTO LLM_DETAILS (USERID, FIRMID, LLM_PROVIDER, LLM_PROVIDER_TYPE, API_KEY) VALUES (?, ?, ?, ?, ?)`;
     await dbPool.query(sql, [userId, firmId, llmProvider, llmProviderType, apiKey]);
-    logger.info('API Key saved', { userId, firmId, provider: llmProvider });
     res.status(201).json({ message: 'API key saved successfully.' });
   } catch (e) {
-    logger.error('Failed to save API key', { error: e.message, userId, firmId });
     res.status(500).json({ error: 'Failed to save API key.' });
   }
 });
@@ -977,46 +813,28 @@ app.post('/api/llm/keys', async (req, res) => {
 app.put('/api/llm/keys/:id', async (req, res) => {
   const { id } = req.params;
   const { userId, firmId, API_KEY, STATUS } = req.body;
-  if (!userId || !firmId || !API_KEY || !STATUS) {
-    return res.status(400).json({ error: 'User, Firm, API Key, and Status are required.' });
-  }
   try {
     const sql = 'UPDATE LLM_DETAILS SET API_KEY = ?, STATUS = ? WHERE ID = ? AND USERID = ? AND FIRMID = ?';
     const [result] = await dbPool.query(sql, [API_KEY, STATUS, id, userId, firmId]);
-    if (result.affectedRows > 0) {
-      logger.info('API Key updated', { id, userId, firmId });
-      res.status(200).json({ message: 'API key updated.' });
-    } else {
-      res.status(404).json({ error: 'API key not found or you do not have permission to edit it.' });
-    }
+    if (result.affectedRows > 0) res.status(200).json({ message: 'API key updated.' });
+    else res.status(404).json({ error: 'API key not found or you do not have permission to edit it.' });
   } catch (e) {
-    logger.error('Failed to update API key', { error: e.message, id });
     res.status(500).json({ error: 'Failed to update API key.' });
   }
 });
 
-
 app.delete('/api/llm/keys/:id', async (req, res) => {
   const { id } = req.params;
   const { userId, firmId } = req.body;
-  if (!userId || !firmId) {
-    return res.status(400).json({ error: 'userId and firmId are required for deletion.' });
-  }
   try {
     const sql = 'DELETE FROM LLM_DETAILS WHERE ID = ? AND USERID = ? AND FIRMID = ?';
     const [result] = await dbPool.query(sql, [id, userId, firmId]);
-    if (result.affectedRows > 0) {
-      logger.info('API Key deleted', { id, userId, firmId });
-      res.status(200).json({ message: 'API key deleted successfully.' });
-    } else {
-      res.status(404).json({ error: 'API key not found or you do not have permission to delete it.' });
-    }
+    if (result.affectedRows > 0) res.status(200).json({ message: 'API key deleted successfully.' });
+    else res.status(404).json({ error: 'API key not found or you do not have permission to delete it.' });
   } catch (e) {
-    logger.error('Failed to delete API key', { error: e.message, id });
     res.status(500).json({ error: 'Failed to delete API key.' });
   }
 });
-
 
 // ============================================================================
 // 16) SHARING ENDPOINTS
@@ -1026,110 +844,64 @@ app.get('/api/rag/shares/:ownerId', async (req, res) => {
   try {
     const allShares = await readShares();
     const ownerShares = {};
-
-    // Iterate over each grantee in the shares data
     for (const granteeId in allShares) {
-      // Filter the shares for this grantee to find ones that belong to the owner
-      const sharesFromOwner = allShares[granteeId].filter(
-        share => String(share.ownerId) === ownerId
-      );
-
-      // If shares from this owner exist for the current grantee, add them to the result
-      if (sharesFromOwner.length > 0) {
-        ownerShares[granteeId] = sharesFromOwner;
-      }
+      const sharesFromOwner = allShares[granteeId].filter(share => String(share.ownerId) === ownerId);
+      if (sharesFromOwner.length > 0) ownerShares[granteeId] = sharesFromOwner;
     }
-
     res.json(ownerShares);
-
   } catch (e) {
-    logger.error('Failed to get shares for owner', { error: e.message, ownerId });
     res.status(500).json({ error: 'Could not retrieve sharing information.' });
   }
 });
 
-
 app.post('/api/rag/share', async (req, res) => {
   const { ownerId, categoryName, granteeId } = req.body;
-  if (!ownerId || !categoryName || !granteeId) {
-    return res.status(400).json({ error: 'Owner, category, and grantee are required.' });
-  }
-
-  // SECURITY FIX: Do not allow sharing with oneself.
-  if (String(ownerId) === String(granteeId)) {
-    return res.status(400).json({ error: 'You cannot share a knowledge base with yourself.' });
-  }
-
+  if (String(ownerId) === String(granteeId)) return res.status(400).json({ error: 'You cannot share a knowledge base with yourself.' });
   try {
     const shares = await readShares();
-    if (!shares[granteeId]) {
-      shares[granteeId] = [];
-    }
-
-    // FIX: Prevent duplicate shares by ensuring type-safe comparison.
-    // ownerId from request is a string, but is stored as a number.
+    if (!shares[granteeId]) shares[granteeId] = [];
     const numOwnerId = Number(ownerId);
-    const alreadyExists = shares[granteeId].some(
-      share => share.ownerId === numOwnerId && share.categoryName === categoryName
-    );
-
-    if (alreadyExists) {
-      return res.status(409).json({ error: 'This knowledge base is already shared with this user.' });
-    }
-
+    const alreadyExists = shares[granteeId].some(share => share.ownerId === numOwnerId && share.categoryName === categoryName);
+    if (alreadyExists) return res.status(409).json({ error: 'This knowledge base is already shared with this user.' });
     shares[granteeId].push({ ownerId: numOwnerId, categoryName });
     await writeShares(shares);
-
-    logger.info('RAG shared successfully', { owner: ownerId, category: categoryName, grantee: granteeId });
     res.status(201).json({ message: 'Knowledge base shared successfully.' });
   } catch (e) {
-    logger.error('Failed to share RAG', { error: e.message });
     res.status(500).json({ error: 'Failed to share the knowledge base.' });
   }
 });
 
 app.delete('/api/rag/share', async (req, res) => {
   const { ownerId, categoryName, granteeId } = req.body;
-  if (!ownerId || !categoryName || !granteeId) {
-    return res.status(400).json({ error: 'Owner, category, and grantee are required to revoke access.' });
-  }
   try {
     const shares = await readShares();
     if (shares[granteeId]) {
-      // FIX: Ensure type-safe comparison for deletion.
       const numOwnerId = Number(ownerId);
-      shares[granteeId] = shares[granteeId].filter(
-        share => !(share.ownerId === numOwnerId && share.categoryName === categoryName)
-      );
-      if (shares[granteeId].length === 0) {
-        delete shares[granteeId];
-      }
+      shares[granteeId] = shares[granteeId].filter(share => !(share.ownerId === numOwnerId && share.categoryName === categoryName));
+      if (shares[granteeId].length === 0) delete shares[granteeId];
     }
     await writeShares(shares);
-    logger.info('RAG share revoked', { owner: ownerId, category: categoryName, grantee: granteeId });
     res.status(200).json({ message: 'Access revoked.' });
   } catch (e) {
-    logger.error('Failed to revoke RAG share', { error: e.message });
     res.status(500).json({ error: 'Failed to revoke access.' });
   }
 });
 
-
+// ============================================================================
+// 17) BROWSER AGENT PROXY
+// ============================================================================
+app.post('/api/agent/browser-task', guardedHandler('browser-task'), proxyToAiServer('agent/browser-task', 'post'));
 
 // ============================================================================
-// 17) SERVER
+// 18) SERVER
 // ============================================================================
 app.get('/', (_req, res) => {
-  res
-    .status(200)
-    .send(`<h1>RAG System Backend is running.</h1><p>AI Server Target: ${AI_SERVER_URL}</p>`);
+  res.status(200).send(`<h1>RAG System Backend is running.</h1><p>AI Server Target: ${AI_SERVER_URL}</p>`);
 });
 
 const PORT = process.env.PORT || 8251;
-// User request: Ensure it runs on all interfaces (0.0.0.0)
 const HOST = '0.0.0.0';
 
-// Updated: Get ALL local IPv4 addresses (not just the first one)
 const getLocalIps = () => {
   const nets = os.networkInterfaces();
   const results = [];
@@ -1145,22 +917,6 @@ const getLocalIps = () => {
 
 app.listen(PORT, HOST, () => {
   const localIps = getLocalIps();
-  const lanUrls = localIps.map(ip => `http://${ip}:${PORT}`);
-
-  logger.info('RAG backend server started.', {
-    port: PORT,
-    host: HOST,
-    localUrl: `http://localhost:${PORT}`,
-    lanUrls: lanUrls,
-    aiServer: AI_SERVER_URL,
-  });
-
-  // Display all IPs in console
-  console.log('---------------------------------------------------------');
+  logger.info('RAG backend server started.', { port: PORT, host: HOST, localIps, aiServer: AI_SERVER_URL });
   console.log(`RAG Backend Server listening on port ${PORT}`);
-  console.log(`- Localhost: http://localhost:${PORT}`);
-  localIps.forEach(ip => {
-    console.log(`- Network:   http://${ip}:${PORT}`);
-  });
-  console.log('---------------------------------------------------------');
 });

@@ -19,6 +19,9 @@ from functools import wraps
 import pandas as pd
 from PIL import Image
 
+# Playwright for Agentic Browser Automation
+from playwright.async_api import async_playwright
+
 # FastAPI Imports
 from fastapi import FastAPI, Request, HTTPException, Depends, File, UploadFile, Form, BackgroundTasks, Response
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -32,7 +35,6 @@ from langdetect import detect, LangDetectException
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams, CollectionStatus
 
-# FIXED: Use langchain_qdrant instead of langchain_community for better compatibility
 from langchain_qdrant import QdrantVectorStore
 
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -268,6 +270,12 @@ class TestRequest(BaseModel):
     num_questions: int = 10
     compliance_rules: Optional[str] = None
 
+class BrowserTaskRequest(BaseModel):
+    firm_id: int
+    url: str
+    instruction: str
+    task_type: str = "general" # options: general, google_form, google_doc, google_sheet, social_comment
+
 
 # -----------------------------------------------------------------------------
 # LLM and API Key Management
@@ -327,6 +335,223 @@ def get_llm(firm_id: int, preferred_provider: str = 'GROQ', db_conn=None):
         if local_conn:
             db_conn.close()
 
+
+# -----------------------------------------------------------------------------
+# Smart Browser Agent (New Agentic Capability)
+# -----------------------------------------------------------------------------
+class SmartBrowserAgent:
+    """
+    An agentic tool that uses Playwright to perform end-to-end tasks on websites.
+    It uses an LLM to "see" the Accessibility Tree of the page and decide which elements to interact with.
+    """
+    def __init__(self, firm_id: int, db_conn):
+        self.llm = get_llm(firm_id, db_conn=db_conn)
+
+    async def run_task(self, url: str, instruction: str, task_type: str):
+        logger.info(f"Starting Browser Agent Task: {task_type} on {url}")
+        
+        async with async_playwright() as p:
+            # Launch in headless mode for server environment
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+                viewport={"width": 1280, "height": 720},
+                locale="en-US"
+            )
+            page = await context.new_page()
+
+            try:
+                await page.goto(url, timeout=60000)
+                # Wait for network idle to ensure dynamic content loads
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=15000)
+                except:
+                    logger.warning("Network idle timeout, proceeding anyway.")
+
+                result_message = ""
+
+                if task_type == "google_form" or task_type == "general":
+                    result_message = await self._handle_smart_form(page, instruction)
+                elif task_type == "google_doc":
+                    result_message = await self._handle_google_doc(page, instruction)
+                elif task_type == "google_sheet":
+                    result_message = await self._handle_google_sheet(page, instruction)
+                elif task_type == "social_comment":
+                    result_message = await self._handle_social_comment(page, instruction)
+                else:
+                    result_message = "Unknown task type."
+
+                # Slight delay to ensure auto-saves (for Google Docs/Sheets)
+                await asyncio.sleep(2)
+                
+                logger.info(f"Browser Agent Task Completed: {result_message}")
+                return {"status": "success", "message": result_message, "url": url}
+
+            except Exception as e:
+                logger.error(f"Browser Task Failed: {e}")
+                screenshot_path = os.path.join(TEMP_FOLDER, f"error_{uuid4().hex}.png")
+                await page.screenshot(path=screenshot_path)
+                logger.info(f"Error screenshot saved to {screenshot_path}")
+                raise HTTPException(status_code=500, detail=f"Browser automation failed: {str(e)}")
+            finally:
+                await browser.close()
+
+    async def _handle_smart_form(self, page, instruction):
+        """
+        Extracts the Accessibility Tree to understand the form structure, 
+        then uses LLM to map user data to specific fields.
+        """
+        # Get the accessibility tree (semantic structure of the page)
+        snapshot = await page.accessibility.snapshot()
+        
+        # Optimize snapshot for LLM (reduce token usage)
+        snapshot_str = json.dumps(snapshot, indent=2)[:15000] # Limit size
+
+        prompt_template = """
+        You are an advanced Browser Automation Agent.
+        Your task is to fill a form on a webpage based on the user's instructions.
+        
+        **User Instruction:** {instruction}
+        
+        **Page Accessibility Tree (Semantic Structure):**
+        {snapshot}
+        
+        **Goal:** Identify the input fields (Role: 'textbox', 'combobox', 'checkbox', etc.) that match the user's data.
+        
+        **Return:** A JSON list of actions. Each action must have:
+        - "role": The accessibility role to target (e.g., "textbox", "button").
+        - "name": The accessibility name/label to target (e.g., "First Name").
+        - "action": "fill" or "click".
+        - "value": The value to type (for "fill").
+        
+        Example:
+        [
+            {{"role": "textbox", "name": "Email", "action": "fill", "value": "test@example.com"}},
+            {{"role": "button", "name": "Submit", "action": "click"}}
+        ]
+        
+        Return ONLY valid JSON.
+        """
+        
+        prompt = ChatPromptTemplate.from_template(prompt_template)
+        chain = prompt | self.llm | JsonOutputParser()
+        
+        actions = await chain.ainvoke({"instruction": instruction, "snapshot": snapshot_str})
+        
+        results = []
+        for act in actions:
+            try:
+                # Playwright's "get_by_role" is robust for accessibility-based selection
+                locator = page.get_by_role(act["role"], name=act["name"])
+                
+                if act["action"] == "fill":
+                    await locator.fill(act["value"])
+                    results.append(f"Filled {act['name']}")
+                elif act["action"] == "click":
+                    await locator.click()
+                    results.append(f"Clicked {act['name']}")
+                    
+                await asyncio.sleep(0.5) # Human-like delay
+            except Exception as e:
+                logger.warning(f"Failed to execute action {act}: {e}")
+                
+        return f"Form actions executed: {', '.join(results)}"
+
+    async def _handle_google_doc(self, page, content):
+        """
+        Specific logic for Google Docs.
+        Google Docs uses a canvas, so standard inputs don't work. We focus the document and simulate typing.
+        """
+        # Wait for the main document canvas/editable area
+        # Google Docs usually exposes an element with role="document" or "textbox" in the accessibility tree
+        try:
+            # Wait for the editor to load
+            await page.wait_for_selector(".kix-appview-editor", timeout=10000)
+            
+            # Click the editing area to ensure focus
+            # We target the specific class Google uses for the page canvas
+            await page.click(".kix-appview-editor") 
+            
+            # Clear existing content (Select All -> Backspace) - Optional, depends on use case
+            # await page.keyboard.press("Control+A")
+            # await page.keyboard.press("Backspace")
+            
+            # Type the new content
+            # We use type() instead of fill() because it sends keystrokes, which canvas apps require
+            await page.keyboard.type(content, delay=50) # 50ms delay mimics human typing
+            
+            return "Typed content into Google Doc."
+        except Exception as e:
+            # Fallback: Try accessibility selector
+            try:
+                await page.get_by_role("textbox", name="Document content").click()
+                await page.keyboard.type(content)
+                return "Typed content using Accessibility selector."
+            except Exception as e2:
+                raise RuntimeError(f"Could not write to Google Doc: {e}")
+
+    async def _handle_google_sheet(self, page, data_instruction):
+        """
+        Specific logic for Google Sheets.
+        Navigates the grid using keyboard commands.
+        """
+        try:
+            # Wait for grid to load
+            await page.wait_for_selector(".grid-container", timeout=10000)
+            
+            # Click top-left cell (approximate) or focus grid
+            await page.click(".grid-container")
+            
+            # Use LLM to parse what data goes where?
+            # For simplicity in this agent, we append data to the current cell or active selection
+            # A more complex agent would parse "Put X in cell A1", but here we assume "Write X"
+            
+            # Simple interaction: Type data, press Enter
+            await page.keyboard.type(data_instruction)
+            await page.keyboard.press("Enter")
+            
+            return "Typed data into Google Sheet active cell."
+        except Exception as e:
+             raise RuntimeError(f"Could not write to Google Sheet: {e}")
+
+    async def _handle_social_comment(self, page, comment):
+        """
+        General logic for social media commenting.
+        Finds the 'Write a comment' box and 'Post' button.
+        """
+        snapshot = await page.accessibility.snapshot()
+        snapshot_str = json.dumps(snapshot)[:10000]
+
+        prompt_template = """
+        You are a social media bot. 
+        Analyze the page structure to find the "Comment" or "Reply" input area and the "Post/Reply" button.
+        
+        **User Comment:** {comment}
+        **Page Structure:** {snapshot}
+        
+        Return JSON actions:
+        [
+           {{"role": "textbox", "name": "Write a comment...", "action": "fill", "value": "{comment}"}},
+           {{"role": "button", "name": "Post", "action": "click"}}
+        ]
+        """
+        prompt = ChatPromptTemplate.from_template(prompt_template)
+        chain = prompt | self.llm | JsonOutputParser()
+        actions = await chain.ainvoke({"comment": comment, "snapshot": snapshot_str})
+        
+        for act in actions:
+            try:
+                locator = page.get_by_role(act["role"], name=act["name"])
+                if act["action"] == "fill":
+                    # Social media often requires clicking the box first
+                    await locator.click() 
+                    await locator.fill(act["value"])
+                elif act["action"] == "click":
+                    await locator.click()
+            except Exception as e:
+                logger.warning(f"Social action failed: {e}")
+                
+        return "Posted comment on social media."
 
 # -----------------------------------------------------------------------------
 # Persona Engine
@@ -1522,11 +1747,20 @@ async def handle_messages(request: Request):
     
     # RETURN NO-OP TO PREVENT DOUBLE-RESPONSE
     return NoOpResponse()
-
+# -----------------------------------------------------------------------------
+# New Agentic Browser Route
+# -----------------------------------------------------------------------------
+@app.post("/agent/browser-task")
+async def browser_task_endpoint(request: BrowserTaskRequest, db=Depends(get_db)):
+    """
+    Triggers the end-to-end browser agent.
+    Task Type options: 'google_form', 'google_doc', 'google_sheet', 'social_comment', 'general'
+    """
+    agent = SmartBrowserAgent(request.firm_id, db_conn=db)
+    return await agent.run_task(request.url, request.instruction, request.task_type)
 # -----------------------------------------------------------------------------
 # STT & TTS Routes (Rest of file...)
 # -----------------------------------------------------------------------------
-# ... (Previous STT/TTS code remains unchanged) ...
 
 @app.post("/voice/stt")
 async def stt_endpoint(
